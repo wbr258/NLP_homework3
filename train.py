@@ -10,28 +10,42 @@ from data_loader import NERDataset
 from model import BiLSTM_CRF
 
 
-def train_epoch(model, train_loader, optimizer, device):
+def train_epoch(model, train_loader, optimizer, device, scaler=None):
     """训练一个epoch"""
     model.train()
     total_loss = 0
     num_batches = 0
     
+    use_amp = scaler is not None
+    
     for batch in tqdm(train_loader, desc="Training"):
-        words = batch['words'].to(device)
-        tags = batch['tags'].to(device)
-        lengths = batch['length'].to(device)
+        # 使用non_blocking加速数据传输（需要pin_memory配合）
+        words = batch['words'].to(device, non_blocking=True)
+        tags = batch['tags'].to(device, non_blocking=True)
+        lengths = batch['length'].to(device, non_blocking=True)
         
         # 前向传播
-        loss = model(words, tags, lengths)
+        if use_amp:
+            with torch.cuda.amp.autocast():
+                loss = model(words, tags, lengths)
+        else:
+            loss = model(words, tags, lengths)
         
         # 反向传播
         optimizer.zero_grad()
-        loss.backward()
         
-        # 梯度裁剪（防止梯度爆炸）
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
-        
-        optimizer.step()
+        if use_amp:
+            scaler.scale(loss).backward()
+            # 梯度裁剪
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            # 梯度裁剪（防止梯度爆炸）
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+            optimizer.step()
         
         total_loss += loss.item()
         num_batches += 1
@@ -62,7 +76,8 @@ def train_model(train_corpus_path, train_label_path,
                 val_corpus_path=None, val_label_path=None,
                 embedding_dim=100, hidden_dim=256, num_layers=1,
                 batch_size=32, num_epochs=20, learning_rate=0.01,
-                dropout=0.5, max_len=128, save_dir='./checkpoints'):
+                dropout=0.5, max_len=128, save_dir='./checkpoints',
+                use_amp=True):
     """训练模型"""
     
     # 创建保存目录
@@ -98,17 +113,25 @@ def train_model(train_corpus_path, train_label_path,
             train_dataset, [train_size, val_size]
         )
     
+    # 优化数据加载：使用多进程和pin_memory加速GPU训练
+    num_workers = 4 if torch.cuda.is_available() else 0
+    pin_memory = torch.cuda.is_available()
+    
     train_loader = DataLoader(
         train_dataset, 
         batch_size=batch_size, 
         shuffle=True,
-        num_workers=0
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=num_workers > 0  # 保持worker进程活跃
     )
     val_loader = DataLoader(
         val_dataset, 
         batch_size=batch_size, 
         shuffle=False,
-        num_workers=0
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=num_workers > 0
     )
     
     # 创建模型
@@ -134,6 +157,11 @@ def train_model(train_corpus_path, train_label_path,
     # 优化器
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     
+    # 混合精度训练的scaler（如果使用GPU且启用AMP）
+    scaler = torch.cuda.amp.GradScaler() if (use_amp and device.type == 'cuda') else None
+    if scaler is not None:
+        print("启用混合精度训练 (AMP)")
+    
     # 学习率调度器
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='min', factor=0.5, patience=3
@@ -157,8 +185,8 @@ def train_model(train_corpus_path, train_label_path,
     for epoch in range(num_epochs):
         print(f"\nEpoch {epoch + 1}/{num_epochs}")
         
-        # 训练
-        train_loss = train_epoch(model, train_loader, optimizer, device)
+        # 训练（使用混合精度训练加速）
+        train_loss = train_epoch(model, train_loader, optimizer, device, scaler=scaler)
         print(f"训练损失: {train_loss:.4f}")
         
         # 验证
@@ -201,18 +229,22 @@ if __name__ == '__main__':
     train_label_path = 'data/train_label.txt'
     
     # 开始训练
+    # 如果使用GPU，建议增大batch_size以提高GPU利用率
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    batch_size = 64 if device.type == 'cuda' else 32
+    
     train_model(
         train_corpus_path=train_corpus_path,
         train_label_path=train_label_path,
         embedding_dim=100,
         hidden_dim=256,
-        
         num_layers=1,
-        batch_size=32,
+        batch_size=batch_size,
         num_epochs=20,
         learning_rate=0.01,
         dropout=0.5,
         max_len=128,
-        save_dir='./checkpoints'
+        save_dir='./checkpoints',
+        use_amp=True  # 使用混合精度训练加速
     )
 

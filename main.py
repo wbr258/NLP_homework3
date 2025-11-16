@@ -36,8 +36,12 @@ def main():
                        help='Dropout比率')
     
     # 训练参数
-    parser.add_argument('--batch_size', type=int, default=32,
-                       help='批次大小')
+    parser.add_argument('--batch_size', type=int, default=None,
+                       help='批次大小（默认：GPU=64, CPU=32）')
+    parser.add_argument('--use_amp', action='store_true', default=True,
+                       help='使用混合精度训练（加速GPU训练）')
+    parser.add_argument('--no_amp', dest='use_amp', action='store_false',
+                       help='不使用混合精度训练')
     parser.add_argument('--num_epochs', type=int, default=20,
                        help='训练轮数')
     parser.add_argument('--learning_rate', type=float, default=0.01,
@@ -56,6 +60,12 @@ def main():
     # 创建保存目录
     os.makedirs(args.save_dir, exist_ok=True)
     
+    # 自动设置batch_size（如果未指定）
+    if args.batch_size is None:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        args.batch_size = 64 if device.type == 'cuda' else 32
+        print(f"自动设置batch_size为: {args.batch_size}")
+    
     if args.mode == 'train' or args.mode == 'both':
         print("="*60)
         print("开始训练模型")
@@ -72,7 +82,8 @@ def main():
             learning_rate=args.learning_rate,
             dropout=args.dropout,
             max_len=args.max_len,
-            save_dir=args.save_dir
+            save_dir=args.save_dir,
+            use_amp=args.use_amp
         )
     
     if args.mode == 'eval' or args.mode == 'both':
