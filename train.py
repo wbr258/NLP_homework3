@@ -22,7 +22,12 @@ def train_epoch(model, train_loader, optimizer, device, scaler=None):
         # 使用non_blocking加速数据传输（需要pin_memory配合）
         words = batch['words'].to(device, non_blocking=True)
         tags = batch['tags'].to(device, non_blocking=True)
-        lengths = batch['length'].to(device, non_blocking=True)
+        # lengths需要确保是tensor格式
+        if isinstance(batch['length'], torch.Tensor):
+            lengths = batch['length'].to(device, non_blocking=True)
+        else:
+            # 如果是list或其他格式，转换为tensor
+            lengths = torch.tensor(batch['length'], dtype=torch.long).to(device, non_blocking=True)
         
         # 前向传播
         if use_amp:
@@ -47,7 +52,13 @@ def train_epoch(model, train_loader, optimizer, device, scaler=None):
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             optimizer.step()
         
-        total_loss += loss.item()
+        # 确保loss是标量后再取item()
+        if isinstance(loss, torch.Tensor):
+            if loss.dim() > 0:
+                loss = loss.mean()
+            total_loss += loss.item()
+        else:
+            total_loss += float(loss)
         num_batches += 1
     
     return total_loss / num_batches
@@ -63,10 +74,20 @@ def validate(model, val_loader, device):
         for batch in tqdm(val_loader, desc="Validating"):
             words = batch['words'].to(device)
             tags = batch['tags'].to(device)
-            lengths = batch['length'].to(device)
+            # lengths需要确保是tensor格式
+            if isinstance(batch['length'], torch.Tensor):
+                lengths = batch['length'].to(device)
+            else:
+                lengths = torch.tensor(batch['length'], dtype=torch.long).to(device)
             
             loss = model(words, tags, lengths)
-            total_loss += loss.item()
+            # 确保loss是标量后再取item()
+            if isinstance(loss, torch.Tensor):
+                if loss.dim() > 0:
+                    loss = loss.mean()
+                total_loss += loss.item()
+            else:
+                total_loss += float(loss)
             num_batches += 1
     
     return total_loss / num_batches
@@ -114,7 +135,10 @@ def train_model(train_corpus_path, train_label_path,
         )
     
     # 优化数据加载：使用多进程和pin_memory加速GPU训练
-    num_workers = 4 if torch.cuda.is_available() else 0
+    # Windows系统使用多进程时需要注意，如果出现问题可以设置num_workers=0
+    import sys
+    is_windows = sys.platform == 'win32'
+    num_workers = 4 if (torch.cuda.is_available() and not is_windows) else 0
     pin_memory = torch.cuda.is_available()
     
     train_loader = DataLoader(
@@ -123,7 +147,7 @@ def train_model(train_corpus_path, train_label_path,
         shuffle=True,
         num_workers=num_workers,
         pin_memory=pin_memory,
-        persistent_workers=num_workers > 0  # 保持worker进程活跃
+        persistent_workers=(num_workers > 0 and not is_windows)  # Windows上persistent_workers可能有问题
     )
     val_loader = DataLoader(
         val_dataset, 
@@ -131,7 +155,7 @@ def train_model(train_corpus_path, train_label_path,
         shuffle=False,
         num_workers=num_workers,
         pin_memory=pin_memory,
-        persistent_workers=num_workers > 0
+        persistent_workers=(num_workers > 0 and not is_windows)
     )
     
     # 创建模型

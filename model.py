@@ -101,7 +101,13 @@ class BiLSTM_CRF(nn.Module):
             tags = tags[:, :actual_seq_len]
             # torchcrf的CRF层需要mask来标记有效位置
             mask = self._create_mask(lengths, actual_seq_len, feats.device)
-            loss = -self.crf(feats, tags, mask=mask, reduction='mean')
+            # CRF返回负对数似然，取负号得到损失
+            # 如果reduction='mean'不工作，手动取平均
+            neg_log_likelihood = self.crf(feats, tags, mask=mask, reduction='mean')
+            loss = -neg_log_likelihood
+            # 确保loss是标量
+            if loss.dim() > 0:
+                loss = loss.mean()
             return loss
         else:
             # 预测模式：使用CRF解码

@@ -119,6 +119,6 @@ class NERDataset(Dataset):
         return {
             'words': torch.LongTensor(word_indices),
             'tags': torch.LongTensor(tag_indices),
-            'length': min(len(self.sentences[idx]), self.max_len)
+            'length': torch.tensor(min(len(self.sentences[idx]), self.max_len), dtype=torch.long)
         }
 
