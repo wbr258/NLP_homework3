@@ -68,9 +68,12 @@ class BiLSTM_CRF(nn.Module):
         # 词嵌入
         embeds = self.embedding(sentence)  # [batch_size, seq_len, embedding_dim]
         
+        # pack_padded_sequence需要lengths在CPU上
+        lengths_cpu = lengths.cpu()
+        
         # 打包序列（处理变长序列）
         packed_embeds = nn.utils.rnn.pack_padded_sequence(
-            embeds, lengths, batch_first=True, enforce_sorted=False
+            embeds, lengths_cpu, batch_first=True, enforce_sorted=False
         )
         
         # LSTM前向传播
