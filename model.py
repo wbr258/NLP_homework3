@@ -66,9 +66,9 @@ class BiLSTM_CRF(nn.Module):
         # LSTM前向传播
         lstm_out, _ = self.lstm(packed_embeds)
         
-        # 解包序列
+        # 解包序列，恢复到原始长度（与sentence相同）
         lstm_out, _ = nn.utils.rnn.pad_packed_sequence(
-            lstm_out, batch_first=True
+            lstm_out, batch_first=True, total_length=sentence.size(1)
         )
         
         # 映射到标签空间
@@ -91,23 +91,33 @@ class BiLSTM_CRF(nn.Module):
         # 获取LSTM特征
         feats = self._get_lstm_features(sentence, lengths)  # [batch_size, seq_len, tag_size]
         
+        # pad_packed_sequence返回的长度是batch中最长序列的长度，可能小于sentence的长度
+        # 需要确保tags和feats的长度一致
+        actual_seq_len = feats.size(1)
+        
         if self.training and tags is not None:
             # 训练模式：计算CRF损失
+            # 截断tags使其与feats长度一致
+            tags = tags[:, :actual_seq_len]
             # torchcrf的CRF层需要mask来标记有效位置
-            mask = self._create_mask(lengths, feats.size(1), feats.device)
+            mask = self._create_mask(lengths, actual_seq_len, feats.device)
             loss = -self.crf(feats, tags, mask=mask, reduction='mean')
             return loss
         else:
             # 预测模式：使用CRF解码
-            mask = self._create_mask(lengths, feats.size(1), feats.device)
+            mask = self._create_mask(lengths, actual_seq_len, feats.device)
             best_path = self.crf.decode(feats, mask=mask)
-            # 将list转换为tensor
-            max_len = feats.size(1)
+            # 将list转换为tensor，恢复到原始sentence的长度
+            original_seq_len = sentence.size(1)
             batch_size = feats.size(0)
-            best_path_tensor = torch.zeros(batch_size, max_len, dtype=torch.long).to(feats.device)
+            best_path_tensor = torch.zeros(batch_size, original_seq_len, dtype=torch.long).to(feats.device)
             for i, path in enumerate(best_path):
                 length = len(path)
-                best_path_tensor[i, :length] = torch.tensor(path, dtype=torch.long).to(feats.device)
+                # 只填充实际长度部分，其余保持为0（会被mask忽略）
+                if length <= original_seq_len:
+                    best_path_tensor[i, :length] = torch.tensor(path, dtype=torch.long).to(feats.device)
+                else:
+                    best_path_tensor[i, :original_seq_len] = torch.tensor(path[:original_seq_len], dtype=torch.long).to(feats.device)
             return best_path_tensor
     
     def _create_mask(self, lengths, max_len, device):
