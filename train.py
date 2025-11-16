@@ -1,0 +1,218 @@
+"""
+训练脚本
+"""
+import torch
+import torch.optim as optim
+from torch.utils.data import DataLoader
+import os
+from tqdm import tqdm
+from data_loader import NERDataset
+from model import BiLSTM_CRF
+
+
+def train_epoch(model, train_loader, optimizer, device):
+    """训练一个epoch"""
+    model.train()
+    total_loss = 0
+    num_batches = 0
+    
+    for batch in tqdm(train_loader, desc="Training"):
+        words = batch['words'].to(device)
+        tags = batch['tags'].to(device)
+        lengths = batch['length'].to(device)
+        
+        # 前向传播
+        loss = model(words, tags, lengths)
+        
+        # 反向传播
+        optimizer.zero_grad()
+        loss.backward()
+        
+        # 梯度裁剪（防止梯度爆炸）
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+        
+        optimizer.step()
+        
+        total_loss += loss.item()
+        num_batches += 1
+    
+    return total_loss / num_batches
+
+
+def validate(model, val_loader, device):
+    """验证"""
+    model.eval()
+    total_loss = 0
+    num_batches = 0
+    
+    with torch.no_grad():
+        for batch in tqdm(val_loader, desc="Validating"):
+            words = batch['words'].to(device)
+            tags = batch['tags'].to(device)
+            lengths = batch['length'].to(device)
+            
+            loss = model(words, tags, lengths)
+            total_loss += loss.item()
+            num_batches += 1
+    
+    return total_loss / num_batches
+
+
+def train_model(train_corpus_path, train_label_path, 
+                val_corpus_path=None, val_label_path=None,
+                embedding_dim=100, hidden_dim=256, num_layers=1,
+                batch_size=32, num_epochs=20, learning_rate=0.01,
+                dropout=0.5, max_len=128, save_dir='./checkpoints'):
+    """训练模型"""
+    
+    # 创建保存目录
+    os.makedirs(save_dir, exist_ok=True)
+    
+    # 加载训练数据
+    print("加载训练数据...")
+    train_dataset = NERDataset(
+        train_corpus_path, 
+        train_label_path,
+        max_len=max_len
+    )
+    print("load success...")
+    # 保存词汇表和标签表（在划分数据集之前）
+    word2idx = train_dataset.word2idx
+    tag2idx = train_dataset.tag2idx
+    idx2tag = train_dataset.idx2tag
+    
+    # 如果有验证集，使用验证集；否则从训练集中划分
+    if val_corpus_path and val_label_path:
+        val_dataset = NERDataset(
+            val_corpus_path,
+            val_label_path,
+            word2idx=word2idx,
+            tag2idx=tag2idx,
+            max_len=max_len
+        )
+    else:
+        # 从训练集中划分20%作为验证集
+        train_size = int(0.8 * len(train_dataset))
+        val_size = len(train_dataset) - train_size
+        train_dataset, val_dataset = torch.utils.data.random_split(
+            train_dataset, [train_size, val_size]
+        )
+    
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=batch_size, 
+        shuffle=True,
+        num_workers=0
+    )
+    val_loader = DataLoader(
+        val_dataset, 
+        batch_size=batch_size, 
+        shuffle=False,
+        num_workers=0
+    )
+    
+    # 创建模型
+    vocab_size = len(word2idx)
+    tag_size = len(tag2idx)
+    
+    print(f"词汇表大小: {vocab_size}")
+    print(f"标签数量: {tag_size}")
+    print(f"标签: {list(tag2idx.keys())}")
+    
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"使用设备: {device}")
+    
+    model = BiLSTM_CRF(
+        vocab_size=vocab_size,
+        tag_size=tag_size,
+        embedding_dim=embedding_dim,
+        hidden_dim=hidden_dim,
+        num_layers=num_layers,
+        dropout=dropout
+    ).to(device)
+    
+    # 优化器
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+    
+    # 学习率调度器
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=3
+    )
+    
+    # 保存词汇表和标签表
+    import pickle
+    with open(os.path.join(save_dir, 'word2idx.pkl'), 'wb') as f:
+        pickle.dump(word2idx, f)
+    with open(os.path.join(save_dir, 'tag2idx.pkl'), 'wb') as f:
+        pickle.dump(tag2idx, f)
+    with open(os.path.join(save_dir, 'idx2tag.pkl'), 'wb') as f:
+        pickle.dump(idx2tag, f)
+    
+    # 训练循环
+    best_val_loss = float('inf')
+    patience = 5
+    patience_counter = 0
+    
+    print("\n开始训练...")
+    for epoch in range(num_epochs):
+        print(f"\nEpoch {epoch + 1}/{num_epochs}")
+        
+        # 训练
+        train_loss = train_epoch(model, train_loader, optimizer, device)
+        print(f"训练损失: {train_loss:.4f}")
+        
+        # 验证
+        val_loss = validate(model, val_loader, device)
+        print(f"验证损失: {val_loss:.4f}")
+        
+        # 学习率调度
+        scheduler.step(val_loss)
+        
+        # 保存最佳模型
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            patience_counter = 0
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'val_loss': val_loss,
+                'vocab_size': vocab_size,
+                'tag_size': tag_size,
+                'embedding_dim': embedding_dim,
+                'hidden_dim': hidden_dim,
+                'num_layers': num_layers,
+                'dropout': dropout,
+            }, os.path.join(save_dir, 'best_model.pth'))
+            print(f"保存最佳模型 (验证损失: {val_loss:.4f})")
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print(f"验证损失在{patience}个epoch内没有改善，提前停止训练")
+                break
+    
+    print("\n训练完成！")
+    return model, word2idx, tag2idx, idx2tag
+
+
+if __name__ == '__main__':
+    # 训练参数
+    train_corpus_path = 'data/train_corpus.txt'
+    train_label_path = 'data/train_label.txt'
+    
+    # 开始训练
+    train_model(
+        train_corpus_path=train_corpus_path,
+        train_label_path=train_label_path,
+        embedding_dim=100,
+        hidden_dim=256,
+        
+        num_layers=1,
+        batch_size=32,
+        num_epochs=20,
+        learning_rate=0.01,
+        dropout=0.5,
+        max_len=128,
+        save_dir='./checkpoints'
+    )
+
