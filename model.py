@@ -105,9 +105,12 @@ class BiLSTM_CRF(nn.Module):
             # 如果reduction='mean'不工作，手动取平均
             neg_log_likelihood = self.crf(feats, tags, mask=mask, reduction='mean')
             loss = -neg_log_likelihood
-            # 确保loss是标量
+            # 确保loss是标量，明确指定dtype为float32
             if loss.dim() > 0:
-                loss = loss.mean()
+                if loss.numel() > 0:
+                    loss = loss.mean().float()
+                else:
+                    loss = torch.tensor(0.0, device=loss.device, dtype=torch.float32)
             return loss
         else:
             # 预测模式：使用CRF解码

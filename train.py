@@ -55,7 +55,11 @@ def train_epoch(model, train_loader, optimizer, device, scaler=None):
         # 确保loss是标量后再取item()
         if isinstance(loss, torch.Tensor):
             if loss.dim() > 0:
-                loss = loss.mean()
+                # 确保tensor有元素且指定dtype
+                if loss.numel() > 0:
+                    loss = loss.mean().float()
+                else:
+                    loss = torch.tensor(0.0, device=loss.device, dtype=torch.float32)
             total_loss += loss.item()
         else:
             total_loss += float(loss)
@@ -84,7 +88,11 @@ def validate(model, val_loader, device):
             # 确保loss是标量后再取item()
             if isinstance(loss, torch.Tensor):
                 if loss.dim() > 0:
-                    loss = loss.mean()
+                    # 确保tensor有元素且指定dtype
+                    if loss.numel() > 0:
+                        loss = loss.mean().float()
+                    else:
+                        loss = torch.tensor(0.0, device=loss.device, dtype=torch.float32)
                 total_loss += loss.item()
             else:
                 total_loss += float(loss)
