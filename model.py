@@ -4,6 +4,7 @@ Bi-LSTM + CRF 模型
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torchcrf import CRF
 
 
 class BiLSTM_CRF(nn.Module):
@@ -43,22 +44,8 @@ class BiLSTM_CRF(nn.Module):
         # 线性层，将LSTM输出映射到标签空间
         self.hidden2tag = nn.Linear(hidden_dim, tag_size)
         
-        # CRF层参数：转移矩阵
-        # transition[i][j] 表示从标签i转移到标签j的分数
-        self.transition = nn.Parameter(torch.randn(tag_size, tag_size))
-        
-        # 初始化转移矩阵
-        # 不允许从非O标签转移到O标签（除非是合理的结束）
-        # 不允许从I-X转移到B-Y（X != Y）
-        self._init_transition()
-        
-    def _init_transition(self):
-        """初始化CRF转移矩阵"""
-        # 将转移矩阵初始化为较小的随机值
-        nn.init.uniform_(self.transition, -0.1, 0.1)
-        
-        # 设置一些约束：不允许从I-X转移到B-Y（X != Y）
-        # 这里我们让模型自己学习，不做硬约束
+        # CRF层（使用torchcrf库）
+        self.crf = CRF(tag_size, batch_first=True)
         
     def _get_lstm_features(self, sentence, lengths):
         """通过LSTM获取特征"""
@@ -89,119 +76,6 @@ class BiLSTM_CRF(nn.Module):
         
         return lstm_feats
     
-    def _score_sentence(self, feats, tags, lengths):
-        """
-        计算给定标签序列的分数
-        Args:
-            feats: [batch_size, seq_len, tag_size] LSTM输出的特征
-            tags: [batch_size, seq_len] 真实标签
-            lengths: [batch_size] 每个序列的实际长度
-        Returns:
-            scores: [batch_size] 每个序列的分数
-        """
-        batch_size = feats.size(0)
-        seq_len = feats.size(1)
-        
-        scores = torch.zeros(batch_size).to(feats.device)
-        
-        for i in range(batch_size):
-            length = lengths[i].item()
-            score = torch.sum(feats[i, range(length), tags[i, :length]])
-            
-            # 添加转移分数
-            for j in range(length - 1):
-                score += self.transition[tags[i, j], tags[i, j + 1]]
-            
-            scores[i] = score
-        
-        return scores
-    
-    def _forward_alg(self, feats, lengths):
-        """
-        前向算法计算所有可能路径的总分数
-        Args:
-            feats: [batch_size, seq_len, tag_size] LSTM输出的特征
-            lengths: [batch_size] 每个序列的实际长度
-        Returns:
-            alpha: [batch_size] 每个序列的前向分数
-        """
-        batch_size = feats.size(0)
-        seq_len = feats.size(1)
-        tag_size = feats.size(2)
-        
-        # 初始化alpha：alpha[i][j] 表示在位置i，标签为j的所有路径的总分数
-        alpha = torch.full((batch_size, seq_len, tag_size), -1e9).to(feats.device)
-        alpha[:, 0, :] = feats[:, 0, :]  # 第一个位置
-        
-        # 动态规划
-        for t in range(1, seq_len):
-            for i in range(batch_size):
-                if t >= lengths[i]:
-                    continue
-                # 计算从所有前一个标签转移到当前标签的分数
-                for j in range(tag_size):
-                    # 前一个位置的所有标签
-                    prev_scores = alpha[i, t-1, :] + self.transition[:, j]
-                    alpha[i, t, j] = torch.logsumexp(prev_scores, dim=0) + feats[i, t, j]
-        
-        # 计算每个序列的最终分数
-        final_scores = torch.zeros(batch_size).to(feats.device)
-        for i in range(batch_size):
-            length = lengths[i].item()
-            final_scores[i] = torch.logsumexp(alpha[i, length-1, :], dim=0)
-        
-        return final_scores
-    
-    def _viterbi_decode(self, feats, lengths):
-        """
-        Viterbi算法解码，找到最优标签序列
-        Args:
-            feats: [batch_size, seq_len, tag_size] LSTM输出的特征
-            lengths: [batch_size] 每个序列的实际长度
-        Returns:
-            best_path: [batch_size, seq_len] 最优标签序列
-            best_score: [batch_size] 最优路径的分数
-        """
-        batch_size = feats.size(0)
-        seq_len = feats.size(1)
-        tag_size = feats.size(2)
-        
-        # 初始化
-        viterbi = torch.full((batch_size, seq_len, tag_size), -1e9).to(feats.device)
-        backpointers = torch.zeros(batch_size, seq_len, tag_size, dtype=torch.long).to(feats.device)
-        
-        # 第一个位置
-        viterbi[:, 0, :] = feats[:, 0, :]
-        
-        # 动态规划
-        for t in range(1, seq_len):
-            for i in range(batch_size):
-                if t >= lengths[i]:
-                    continue
-                for j in range(tag_size):
-                    # 计算从所有前一个标签转移到当前标签的分数
-                    prev_scores = viterbi[i, t-1, :] + self.transition[:, j]
-                    best_score, best_prev = torch.max(prev_scores, dim=0)
-                    viterbi[i, t, j] = best_score + feats[i, t, j]
-                    backpointers[i, t, j] = best_prev
-        
-        # 回溯找到最优路径
-        best_path = torch.zeros(batch_size, seq_len, dtype=torch.long).to(feats.device)
-        best_scores = torch.zeros(batch_size).to(feats.device)
-        
-        for i in range(batch_size):
-            length = lengths[i].item()
-            # 找到最后一个位置的最优标签
-            best_score, best_tag = torch.max(viterbi[i, length-1, :], dim=0)
-            best_scores[i] = best_score
-            best_path[i, length-1] = best_tag
-            
-            # 回溯
-            for t in range(length-2, -1, -1):
-                best_tag = backpointers[i, t+1, best_tag]
-                best_path[i, t] = best_tag
-        
-        return best_path, best_scores
     
     def forward(self, sentence, tags=None, lengths=None):
         """
@@ -215,16 +89,40 @@ class BiLSTM_CRF(nn.Module):
             预测时返回最优标签序列
         """
         # 获取LSTM特征
-        feats = self._get_lstm_features(sentence, lengths)
+        feats = self._get_lstm_features(sentence, lengths)  # [batch_size, seq_len, tag_size]
         
         if self.training and tags is not None:
-            # 训练模式：计算损失
-            forward_score = self._forward_alg(feats, lengths)
-            gold_score = self._score_sentence(feats, tags, lengths)
-            loss = forward_score - gold_score
-            return loss.mean()
+            # 训练模式：计算CRF损失
+            # torchcrf的CRF层需要mask来标记有效位置
+            mask = self._create_mask(lengths, feats.size(1), feats.device)
+            loss = -self.crf(feats, tags, mask=mask, reduction='mean')
+            return loss
         else:
-            # 预测模式：返回最优路径
-            best_path, _ = self._viterbi_decode(feats, lengths)
-            return best_path
+            # 预测模式：使用CRF解码
+            mask = self._create_mask(lengths, feats.size(1), feats.device)
+            best_path = self.crf.decode(feats, mask=mask)
+            # 将list转换为tensor
+            max_len = feats.size(1)
+            batch_size = feats.size(0)
+            best_path_tensor = torch.zeros(batch_size, max_len, dtype=torch.long).to(feats.device)
+            for i, path in enumerate(best_path):
+                length = len(path)
+                best_path_tensor[i, :length] = torch.tensor(path, dtype=torch.long).to(feats.device)
+            return best_path_tensor
+    
+    def _create_mask(self, lengths, max_len, device):
+        """
+        创建mask矩阵，标记有效位置
+        Args:
+            lengths: [batch_size] 每个序列的实际长度
+            max_len: 最大序列长度
+            device: 设备
+        Returns:
+            mask: [batch_size, max_len] 布尔tensor，True表示有效位置
+        """
+        batch_size = lengths.size(0)
+        # 使用向量化操作创建mask，更高效
+        range_tensor = torch.arange(max_len, device=device).unsqueeze(0).expand(batch_size, -1)
+        mask = range_tensor < lengths.unsqueeze(1)
+        return mask
 
